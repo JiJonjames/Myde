@@ -1211,9 +1211,9 @@ const imgTag = (p, { eager = false, chain } = {}) =>
 const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]):not([type=hidden]),select:not([disabled]),textarea:not([disabled]),iframe,[tabindex]:not([tabindex="-1"])';
 const Modal = {
   stack: [],
-  open(el, { onClose } = {}) {
+  open(el, { onClose, beforeClose } = {}) {
     if (this.stack.includes(el)) return;
-    el._ret = document.activeElement; el._onClose = onClose;
+    el._ret = document.activeElement; el._onClose = onClose; el._beforeClose = beforeClose;
     el.hidden = false;
     requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('open')));
     this.stack.push(el);
@@ -1231,11 +1231,26 @@ const Modal = {
     if (el._ret && document.contains(el._ret)) el._ret.focus({ preventScroll: true });
   },
   top() { return this.stack.at(-1); },
+  /** user-initiated close (Esc, backdrop, ×, 취소) — may be vetoed, e.g. unsaved edits */
+  async dismiss(el = this.stack.at(-1)) {
+    if (!el || !this.stack.includes(el) || el._asking) return;
+    if (el._beforeClose) {
+      el._asking = true;
+      const ok = await el._beforeClose();
+      el._asking = false;
+      if (!ok) return;
+    }
+    this.close(el);
+  },
 };
+/* Remember where a press started: a drag that begins inside a panel (e.g. selecting text)
+   and ends on the backdrop must not count as a backdrop click. */
+let pressTarget = null;
+document.addEventListener('pointerdown', (e) => { pressTarget = e.target; }, true);
 document.addEventListener('keydown', (e) => {
   const top = Modal.top();
   if (!top) return;
-  if (e.key === 'Escape') { e.preventDefault(); Modal.close(top); return; }
+  if (e.key === 'Escape') { e.preventDefault(); Modal.dismiss(top); return; }
   if (e.key === 'Tab') {
     const f = $$(FOCUSABLE, top).filter((x) => x.offsetParent !== null || x === document.activeElement);
     if (!f.length) return;
@@ -2065,7 +2080,8 @@ const Editor = {
     this.origUpdated = this.d.updatedAt;
     this.added = []; this.saved = false; this.slugTouched = !!p;
     this.render();
-    Modal.open(this.el, { onClose: () => this.cleanup() });
+    this.snap = this.snapshot();
+    Modal.open(this.el, { onClose: () => this.cleanup(), beforeClose: () => this.confirmDiscard() });
   },
   render() {
     const d = this.d, s = d.story;
@@ -2234,6 +2250,15 @@ const Editor = {
       rerender();
     } catch (e) { storageError(e); btn.disabled = false; }
   },
+  snapshot() {
+    const fields = [...new FormData(this.form)].map(([k, v]) => [k, typeof v === 'string' ? v : '']);
+    return JSON.stringify([fields, this.d.cover, this.d.gallery]);
+  },
+  isDirty() { return !this.saved && this.snapshot() !== this.snap; },
+  async confirmDiscard() {
+    if (!this.isDirty()) return true;
+    return confirmDialog({ title: '저장하지 않은 변경 내용이 있어요', body: '지금 닫으면 입력한 내용과 새로 올린 이미지가 사라져요.', ok: '버리고 닫기', danger: true });
+  },
   async cleanup() {
     if (this.saved) return;
     const keep = new Set(this.orig);
@@ -2334,7 +2359,10 @@ async function exportDeploy() {
    ========================================================= */
 document.addEventListener('click', async (e) => {
   // overlay backdrop click closes
-  if (e.target.matches('.modal, .search, .lightbox') && Modal.top() === e.target) { Modal.close(e.target); return; }
+  if (e.target.matches('.modal, .search, .lightbox') && Modal.top() === e.target) {
+    if (pressTarget === e.target) Modal.dismiss(e.target);
+    return;
+  }
   const a = e.target.closest('a[href]');
   if (a) {
     const href = a.getAttribute('href');
@@ -2345,7 +2373,7 @@ document.addEventListener('click', async (e) => {
       go(href); return;
     }
   }
-  if (e.target.closest('[data-close]')) { Modal.close(e.target.closest('.modal, .search, .lightbox')); return; }
+  if (e.target.closest('[data-close]')) { Modal.dismiss(e.target.closest('.modal, .search, .lightbox')); return; }
   const t = e.target.closest('[data-action]'); if (!t) return;
   const id = t.dataset.id;
   switch (t.dataset.action) {
@@ -2400,7 +2428,7 @@ document.addEventListener('click', async (e) => {
       if (!Editor.d.cover) Editor.d.cover = u; else Editor.d.gallery.push(u);
       inp.value = ''; Editor.renderImages(); break;
     }
-    case 'ed-delete': { const did = Editor.d.id; Modal.close(Editor.el); await sleep(120); if (!(await deleteProject(did)) && Store.byId(did)) Editor.open(Store.byId(did)); break; }
+    case 'ed-delete': { if (await deleteProject(Editor.d.id)) Modal.close(Editor.el); break; }
   }
 });
 document.addEventListener('input', (e) => {
